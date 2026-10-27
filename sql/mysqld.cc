@@ -8183,6 +8183,10 @@ int mysqld_main(int argc, char **argv)
     unireg_abort(MYSQLD_ABORT_EXIT);  // Will do exit
   }
 
+  // Options have been parsed; publish the initial rate before serving SQL.
+  log_throttle_qni.update_rate(nullptr,
+                             opt_log_throttle_queries_not_using_indexes);
+
   keyring_lockable_init();
 
   my_init_signals();

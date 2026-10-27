@@ -615,10 +615,12 @@ class Slow_log_throttle : public Log_throttle {
   ulonglong total_lock_time;
 
   /**
-    A reference to the threshold ("no more than n log lines per ...").
-    References a (system-?) variable in the server.
+    Published rate. Query threads must not read the mutable system variable.
+    Updates and all accounting are serialized by LOCK_log_throttle.
   */
-  ulong *rate;
+  std::atomic<ulong> rate;
+  ulong remaining = 0;
+  ulong suppressed_count = 0;
 
   /**
     The routine we call to actually log a line (our summary).
@@ -637,6 +639,9 @@ class Slow_log_throttle : public Log_throttle {
   */
   void new_window(ulonglong now);
 
+  // Retire one statistics snapshot without replenishing the window's quota.
+  ulong drain_summary(ulonglong *lock_time, ulonglong *exec_time);
+
   /**
     Actually print the prepared summary to log.
   */
@@ -645,7 +650,7 @@ class Slow_log_throttle : public Log_throttle {
 
  public:
   /**
-    @param threshold     suppress after this many queries ...
+    @param threshold     initial rate; later changes require update_rate()
     @param lock          mutex to use for consistency of calculations
     @param window_usecs  ... in this many micro-seconds
     @param logger        call this function to log a single line (our summary)
@@ -660,14 +665,22 @@ class Slow_log_throttle : public Log_throttle {
     The summary states the number of queries that were qualified for
     inclusion in the log, but were not printed because of the rate-limiting,
     and their respective totals for lock and execution time.
-    This wrapper for prepare_summary() and print_summary() handles the
-    locking/unlocking.
+    Drain the counts and times together under the throttle mutex. Printing
+    does not replenish the quota or start a new window.
 
     @param thd                 The THD that tries to log the statement.
     @retval false              Logging was not suppressed, no summary needed.
     @retval true               Logging was suppressed; a summary was printed.
   */
   bool flush(THD *thd);
+
+  /**
+    Drain pending statistics and publish a new rate under the throttle mutex.
+    An unchanged rate preserves the current quota/window. A changed rate
+    starts a new window on the next eligible query; zero disables throttling.
+    The startup caller may pass nullptr before any queries have been logged.
+  */
+  bool update_rate(THD *thd, ulong new_rate);
 
   /**
     Top-level function.

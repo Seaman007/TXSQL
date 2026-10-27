@@ -1702,6 +1702,9 @@ void Slow_log_throttle::new_window(ulonglong now) {
   Log_throttle::new_window(now);
   total_exec_time = 0;
   total_lock_time = 0;
+  suppressed_count = 0;
+  remaining = rate.load(std::memory_order_relaxed);
+  m_close_window_at.store(get_window_end(), std::memory_order_relaxed);
 }
 
 Slow_log_throttle::Slow_log_throttle(ulong *threshold, mysql_mutex_t *lock,
@@ -1710,7 +1713,7 @@ Slow_log_throttle::Slow_log_throttle(ulong *threshold, mysql_mutex_t *lock,
     : Log_throttle(window_usecs, msg),
       total_exec_time(0),
       total_lock_time(0),
-      rate(threshold),
+      rate(*threshold),
       log_summary(logger),
       LOCK_log_throttle(lock) {}
 
@@ -1748,83 +1751,79 @@ void Slow_log_throttle::print_summary(THD *thd, ulong suppressed,
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
+ulong Slow_log_throttle::drain_summary(ulonglong *lock_time,
+                                      ulonglong *exec_time) {
+  const ulong suppressed = suppressed_count;
+  *lock_time = total_lock_time;
+  *exec_time = total_exec_time;
+  suppressed_count = 0;
+  total_lock_time = total_exec_time = 0;
+  return suppressed;
+}
+
 bool Slow_log_throttle::flush(THD *thd) {
-  // Write summary if we throttled.
   mysql_mutex_lock(LOCK_log_throttle);
-  ulonglong print_lock_time = total_lock_time;
-  ulonglong print_exec_time = total_exec_time;
-  ulong suppressed_count = prepare_summary(*rate);
+  ulonglong lock_time, exec_time;
+  const ulong suppressed = drain_summary(&lock_time, &exec_time);
   mysql_mutex_unlock(LOCK_log_throttle);
-  if (suppressed_count > 0) {
-    print_summary(thd, suppressed_count, print_lock_time, print_exec_time);
-    return true;
+  if (suppressed == 0) return false;
+  print_summary(thd, suppressed, lock_time, exec_time);
+  return true;
+}
+
+bool Slow_log_throttle::update_rate(THD *thd, ulong new_rate) {
+  mysql_mutex_lock(LOCK_log_throttle);
+  ulonglong lock_time, exec_time;
+  const ulong suppressed = drain_summary(&lock_time, &exec_time);
+  if (new_rate != rate.load(std::memory_order_relaxed)) {
+    remaining = 0;
+    m_close_window_at.store(0, std::memory_order_relaxed);
+    rate.store(new_rate, std::memory_order_relaxed);
   }
-  return false;
+  mysql_mutex_unlock(LOCK_log_throttle);
+  if (suppressed == 0) return false;
+  print_summary(thd, suppressed, lock_time, exec_time);
+  return true;
 }
 
 bool Slow_log_throttle::log(THD *thd, bool eligible) {
-  bool suppress_current = false;
-
-  /*
-    If throttling is enabled, we might have to write a summary even if
-    the current query is not of the type we handle.
-  */
-  if (*rate > 0) {
-    if (!eligible) {
-      const ulonglong close_at =
-          m_close_window_at.load(std::memory_order_relaxed);
-      if (close_at == 0 || my_micro_time() < close_at) return false;
-    }
-    mysql_mutex_lock(LOCK_log_throttle);
-
-    ulong suppressed_count = 0;
-    ulonglong print_lock_time = total_lock_time;
-    ulonglong print_exec_time = total_exec_time;
-    ulonglong end_utime_of_query = my_micro_time();
-
-    /*
-      If the window has expired, we'll try to write a summary line.
-      The subroutine will know whether we actually need to.
-    */
-    if (!in_window(end_utime_of_query)) {
-      suppressed_count = prepare_summary(*rate);
-      // start new window only if this is the statement type we handle
-      if (eligible) new_window(end_utime_of_query);
-      m_close_window_at.store(eligible ? get_window_end() : 0,
-                              std::memory_order_relaxed);
-    }
-    if (eligible && inc_log_count(*rate)) {
-      /*
-        Current query's logging should be suppressed.
-        Add its execution time and lock time to totals for the current window.
-      */
-      total_exec_time += (end_utime_of_query - thd->start_utime);
-      total_lock_time += thd->get_lock_usec();
-      suppress_current = true;
-    }
-
-    mysql_mutex_unlock(LOCK_log_throttle);
-
-    /*
-      print_summary() is deferred until after we release the locks to
-      avoid congestion. All variables we hand in are local to the caller,
-      so things would even be safe if print_summary() hadn't finished by the
-      time the next one comes around (60s later at the earliest for now).
-      The current design will produce correct data, but does not guarantee
-      order (there is a theoretical race condition here where the above
-      new_window()/unlock() may enable a different thread to print a warning
-      for the new window before the current thread gets to print_summary().
-      If the requirements ever change, add a print_lock to the object that
-      is held during print_summary(), AND that is briefly locked before
-      returning from this function if(eligible && !suppress_current).
-      This should ensure correct ordering of summaries with regard to any
-      follow-up summaries as well as to any (non-suppressed) warnings (of
-      the type we handle) from the next window.
-    */
-    if (suppressed_count > 0)
-      print_summary(thd, suppressed_count, print_lock_time, print_exec_time);
+  if (rate.load(std::memory_order_relaxed) == 0) return false;
+  if (!eligible) {
+    const ulonglong close_at =
+        m_close_window_at.load(std::memory_order_relaxed);
+    if (close_at == 0 || my_micro_time() < close_at) return false;
   }
 
+  bool suppress_current = false;
+  ulong suppressed = 0;
+  ulonglong lock_time = 0, exec_time = 0;
+  mysql_mutex_lock(LOCK_log_throttle);
+  // A SET may have disabled throttling after the lock-free check.
+  if (rate.load(std::memory_order_relaxed) != 0) {
+    const ulonglong now = my_micro_time();
+    if (m_close_window_at.load(std::memory_order_relaxed) == 0 ||
+        !in_window(now)) {
+      suppressed = drain_summary(&lock_time, &exec_time);
+      if (eligible)
+        new_window(now);
+      else
+        m_close_window_at.store(0, std::memory_order_relaxed);
+    }
+    if (eligible) {
+      if (remaining != 0) {
+        --remaining;
+      } else {
+        ++suppressed_count;
+        total_exec_time += now - thd->start_utime;
+        total_lock_time += thd->get_lock_usec();
+        suppress_current = true;
+      }
+    }
+  }
+  mysql_mutex_unlock(LOCK_log_throttle);
+
+  // Disjoint snapshots may be printed in callback scheduling order.
+  if (suppressed != 0) print_summary(thd, suppressed, lock_time, exec_time);
   return suppress_current;
 }
 

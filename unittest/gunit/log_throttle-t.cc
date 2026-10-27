@@ -23,6 +23,9 @@
 #include <gtest/gtest.h>
 #include <sys/types.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <vector>
 #include <chrono>
 #include <future>
 #include <thread>
@@ -32,6 +35,7 @@
 
 #include "mysql/psi/mysql_mutex.h"
 #include "sql/log.h"
+#include "sql/sql_class.h"
 #include "unittest/gunit/test_utils.h"
 
 namespace log_throttle_unittest {
@@ -39,11 +43,15 @@ namespace log_throttle_unittest {
 using my_testing::Server_initializer;
 
 int summary_count = 0;
-char last_query[10];
+char last_query[32];
+ulonglong last_lock_time = 0;
+ulonglong last_exec_time = 0;
 
-static bool slow_logger(THD *, const char *query, size_t, bool, ulonglong,
-                        ulonglong) {
+static bool slow_logger(THD *, const char *query, size_t, bool, ulonglong lock_time,
+                        ulonglong exec_time) {
   summary_count++;
+  last_lock_time = lock_time;
+  last_exec_time = exec_time;
   strcpy(last_query, query);
   return false;
 }
@@ -100,9 +108,9 @@ TEST_F(LogThrottleTest, SlowLogBasic) {
   EXPECT_FALSE(throttle.flush(thd()));
   EXPECT_EQ(1, summary_count);
 
-  // Get another summary printed
-  EXPECT_FALSE(throttle.log(thd(), true));
-  EXPECT_FALSE(throttle.log(thd(), true));
+  // A summary does not replenish the current window quota.
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
   EXPECT_TRUE(throttle.log(thd(), true));
   EXPECT_TRUE(throttle.flush(thd()));
   EXPECT_EQ(2, summary_count);
@@ -122,18 +130,18 @@ TEST_F(LogThrottleTest, SlowLogThresholdChange) {
   EXPECT_FALSE(throttle.flush(thd()));
   EXPECT_EQ(0, summary_count);
 
-  // Reduce threshold, flush and check that summary was printed
-  threshold = 1;
-  EXPECT_TRUE(throttle.flush(thd()));
-  EXPECT_EQ(1, summary_count);
+  // Changing the rate must not invent suppressed events.
+  EXPECT_FALSE(throttle.update_rate(thd(), 1));
+  EXPECT_EQ(0, summary_count);
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
 
-  // Increase threshold and reach it
-  threshold = 3;
+  // A changed rate retires the old epoch and applies to the next query.
+  EXPECT_TRUE(throttle.update_rate(thd(), 3));
+  EXPECT_STREQ("1", last_query);
   EXPECT_FALSE(throttle.log(thd(), true));
   EXPECT_FALSE(throttle.log(thd(), true));
   EXPECT_FALSE(throttle.log(thd(), true));
-
-  // Flush and check that summary was not printed
   EXPECT_FALSE(throttle.flush(thd()));
   EXPECT_EQ(1, summary_count);
 }
@@ -153,8 +161,7 @@ TEST_F(LogThrottleTest, SlowLogSuppressCount) {
   EXPECT_EQ(1, summary_count);
   EXPECT_STREQ("3", last_query);
 
-  // Suppress 2 events
-  EXPECT_FALSE(throttle.log(thd(), true));
+  // The exhausted quota remains exhausted after flushing.
   EXPECT_FALSE(throttle.log(thd(), false));
   EXPECT_TRUE(throttle.log(thd(), true));
   EXPECT_TRUE(throttle.log(thd(), true));
@@ -218,6 +225,159 @@ TEST_F(LogThrottleTest, IneligibleClosesExpiredWindow) {
   EXPECT_EQ(1, summary_count);
   EXPECT_FALSE(throttle.log(thd(), true));
   EXPECT_TRUE(throttle.log(thd(), true));
+}
+
+// The old implementation subtracted the new rate from the old total count.
+TEST_F(LogThrottleTest, RateChangesReportActualSuppression) {
+  for (ulong new_rate : {7UL, 2UL, 0UL, 100UL}) {
+    ulong threshold = 5;
+    Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+    for (int i = 0; i < 40; ++i) EXPECT_EQ(i >= 5, throttle.log(thd(), true));
+    EXPECT_TRUE(throttle.update_rate(thd(), new_rate));
+    EXPECT_STREQ("35", last_query);
+    EXPECT_FALSE(throttle.flush(thd()));
+    if (new_rate == 0) {
+      for (int i = 0; i < 40; ++i) EXPECT_FALSE(throttle.log(thd(), true));
+    } else {
+      for (ulong i = 0; i < new_rate; ++i) EXPECT_FALSE(throttle.log(thd(), true));
+      EXPECT_TRUE(throttle.log(thd(), true));
+      EXPECT_TRUE(throttle.flush(thd()));
+      EXPECT_STREQ("1", last_query);
+    }
+  }
+}
+
+TEST_F(LogThrottleTest, SameRatePreservesRemainingQuota) {
+  ulong threshold = 3;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_FALSE(throttle.update_rate(thd(), 3));
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.update_rate(thd(), 3));
+  EXPECT_STREQ("1", last_query);
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.flush(thd()));
+  EXPECT_STREQ("1", last_query);
+}
+
+TEST_F(LogThrottleTest, SummaryDrainsCountsAndTimesTogether) {
+  ulong threshold = 1;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+  EXPECT_FALSE(throttle.log(thd(), true));
+  thd()->start_utime = my_micro_time() - 10000000;
+  thd()->pop_lock_usec(7);
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.flush(thd()));
+  EXPECT_STREQ("1", last_query);
+  EXPECT_EQ(7U, last_lock_time);
+  const ulonglong first_exec_time = last_exec_time;
+  EXPECT_GE(first_exec_time, 10000000U);
+
+  thd()->start_utime = my_micro_time();
+  thd()->pop_lock_usec(3);
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.flush(thd()));
+  EXPECT_STREQ("1", last_query);
+  EXPECT_EQ(3U, last_lock_time);
+  EXPECT_LT(last_exec_time, first_exec_time);
+  EXPECT_FALSE(throttle.flush(thd()));
+}
+
+TEST_F(LogThrottleTest, EnableAfterStartupAndDisable) {
+  ulong threshold = 0;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+  EXPECT_FALSE(throttle.update_rate(nullptr, 2));
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.update_rate(thd(), 0));
+  EXPECT_STREQ("1", last_query);
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_FALSE(throttle.update_rate(thd(), 1));
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+}
+
+static std::atomic<ulong> concurrent_reported{0};
+static std::atomic<ulonglong> concurrent_lock_time{0};
+static bool concurrent_logger(THD *, const char *query, size_t, bool,
+                              ulonglong lock_time, ulonglong) {
+  concurrent_reported.fetch_add(std::strtoul(query, nullptr, 10));
+  concurrent_lock_time.fetch_add(lock_time);
+  return false;
+}
+
+TEST_F(LogThrottleTest, ConcurrentSameRateDoesNotRefillQuota) {
+  ulong threshold = 1000;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000,
+                            concurrent_logger, "%lu");
+  concurrent_reported = 0;
+  concurrent_lock_time = 0;
+  std::atomic<ulong> admitted{0}, suppressed{0};
+  std::atomic<bool> start{false};
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 8; ++t) {
+    workers.emplace_back([&] {
+      my_thread_init();
+      THD *worker = new THD(false);
+      worker->store_globals();
+      worker->start_utime = my_micro_time();
+      worker->pop_lock_usec(1);
+      while (!start.load()) std::this_thread::yield();
+      for (int i = 0; i < 4000; ++i) {
+        if (throttle.log(worker, true))
+          ++suppressed;
+        else
+          ++admitted;
+      }
+      delete worker;
+      my_thread_end();
+    });
+  }
+  start = true;
+  for (int i = 0; i < 500; ++i) {
+    throttle.update_rate(thd(), 1000);
+    throttle.flush(thd());
+  }
+  for (auto &worker : workers) worker.join();
+  throttle.flush(thd());
+  EXPECT_EQ(1000U, admitted.load());
+  EXPECT_EQ(31000U, suppressed.load());
+  EXPECT_EQ(suppressed.load(), concurrent_reported.load());
+  EXPECT_EQ(suppressed.load(), concurrent_lock_time.load());
+}
+
+TEST_F(LogThrottleTest, ConcurrentChangedRatesConserveStatistics) {
+  ulong threshold = 5;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000,
+                            concurrent_logger, "%lu");
+  concurrent_reported = 0;
+  concurrent_lock_time = 0;
+  std::atomic<ulong> suppressed{0};
+  std::atomic<bool> start{false};
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 4; ++t) {
+    workers.emplace_back([&] {
+      my_thread_init();
+      THD *worker = new THD(false);
+      worker->store_globals();
+      worker->start_utime = my_micro_time();
+      worker->pop_lock_usec(1);
+      while (!start.load()) std::this_thread::yield();
+      for (int i = 0; i < 8000; ++i)
+        if (throttle.log(worker, true)) ++suppressed;
+      delete worker;
+      my_thread_end();
+    });
+  }
+  start = true;
+  for (int i = 0; i < 500; ++i) throttle.update_rate(thd(), (i % 3) * 5);
+  for (auto &worker : workers) worker.join();
+  throttle.flush(thd());
+  EXPECT_EQ(suppressed.load(), concurrent_reported.load());
+  EXPECT_EQ(suppressed.load(), concurrent_lock_time.load());
 }
 
 }  // namespace log_throttle_unittest

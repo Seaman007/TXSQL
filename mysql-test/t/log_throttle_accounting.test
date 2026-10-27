@@ -1,0 +1,101 @@
+# Exercise the actual SET GLOBAL callback, including the command-line rate.
+--disable_query_log
+--disable_result_log
+SET @saved_slow=@@global.slow_query_log;
+SET @saved_noindex=@@global.log_queries_not_using_indexes;
+SET @saved_rate=@@global.log_throttle_queries_not_using_indexes;
+SET @saved_file=@@global.slow_query_log_file;
+SET @saved_output=@@global.log_output;
+SET @saved_long=@@session.long_query_time;
+SET @saved_min=@@session.min_examined_row_limit;
+SET GLOBAL slow_query_log=OFF;
+SET SESSION long_query_time=10;
+SET SESSION min_examined_row_limit=0;
+CREATE TABLE throttle_accounting (id INT PRIMARY KEY, k INT) ENGINE=InnoDB;
+INSERT INTO throttle_accounting VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8);
+eval SET GLOBAL slow_query_log_file='$MYSQL_TMP_DIR/throttle_accounting.log';
+SET GLOBAL log_output='FILE';
+SET GLOBAL log_queries_not_using_indexes=ON;
+SET GLOBAL slow_query_log=ON;
+# The initial rate of 5 comes from the .opt file, not SET GLOBAL.
+--let $queries=40
+while ($queries)
+{
+  SELECT /*throttle_startup*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=7;
+--let $queries=10
+while ($queries)
+{
+  SELECT /*throttle_raise*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=7;
+--let $queries=10
+while ($queries)
+{
+  SELECT /*throttle_same*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=2;
+--let $queries=10
+while ($queries)
+{
+  SELECT /*throttle_lower*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=0;
+--let $queries=10
+while ($queries)
+{
+  SELECT /*throttle_disabled*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=5;
+--let $queries=10
+while ($queries)
+{
+  SELECT /*throttle_enable*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=100;
+--let $queries=101
+while ($queries)
+{
+  SELECT /*throttle_large*/ k FROM throttle_accounting WHERE k=3;
+  --dec $queries
+}
+SET GLOBAL log_throttle_queries_not_using_indexes=0;
+SET GLOBAL slow_query_log=OFF;
+--let SLOW_ACCOUNTING_LOG=$MYSQL_TMP_DIR/throttle_accounting.log
+--enable_result_log
+--perl
+use strict;
+use warnings;
+open(my $fh, '<', $ENV{'SLOW_ACCOUNTING_LOG'}) or die "open slow log: $!";
+local $/;
+my $text=<$fh>;
+close($fh);
+my %expected=(startup=>5, raise=>7, same=>0, lower=>2,
+              disabled=>10, enable=>5, large=>100);
+foreach my $name (sort keys %expected) {
+  my $count=()=$text =~ /SELECT \/\*throttle_$name\*\//g;
+  die "$name logged $count, expected $expected{$name}" if $count != $expected{$name};
+}
+my @summaries=$text =~ /throttle:\s+(\d+) 'index not used' warning\(s\) suppressed/g;
+die "wrong suppression summaries: @summaries" unless "@summaries" eq "35 3 10 8 5 1";
+print "Startup rate, actual suppression counts and rate-change policy: OK\n";
+EOF
+--disable_result_log
+DROP TABLE throttle_accounting;
+SET GLOBAL log_throttle_queries_not_using_indexes=@saved_rate;
+SET GLOBAL log_queries_not_using_indexes=@saved_noindex;
+SET GLOBAL slow_query_log_file=@saved_file;
+SET GLOBAL log_output=@saved_output;
+SET SESSION long_query_time=@saved_long;
+SET SESSION min_examined_row_limit=@saved_min;
+SET GLOBAL slow_query_log=@saved_slow;
+--remove_file $MYSQL_TMP_DIR/throttle_accounting.log
+--enable_result_log
+--enable_query_log
