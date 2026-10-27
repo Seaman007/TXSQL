@@ -23,6 +23,13 @@
 #include <gtest/gtest.h>
 #include <sys/types.h>
 
+#include <chrono>
+#include <future>
+#include <thread>
+
+#include "my_systime.h"
+#include "my_thread.h"
+
 #include "mysql/psi/mysql_mutex.h"
 #include "sql/log.h"
 #include "unittest/gunit/test_utils.h"
@@ -157,5 +164,60 @@ TEST_F(LogThrottleTest, SlowLogSuppressCount) {
   EXPECT_STREQ("2", last_query);
 }
 // End of Slow_log_throttles test cases.
+
+
+// Ineligible statements need not wait for accounting in another connection.
+TEST_F(LogThrottleTest, IneligibleWithoutWindowBypassesMutex) {
+  ulong threshold = 1;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+  mysql_mutex_lock(&m_mutex);
+  auto result = std::async(std::launch::async, [&] {
+    my_thread_init();
+    const bool suppressed = throttle.log(thd(), false);
+    my_thread_end();
+    return suppressed;
+  });
+  const auto ready = result.wait_for(std::chrono::seconds(5));
+  mysql_mutex_unlock(&m_mutex);  // Also release a regressed implementation.
+  EXPECT_EQ(std::future_status::ready, ready);
+  EXPECT_FALSE(result.get());
+  EXPECT_EQ(0, summary_count);
+}
+
+TEST_F(LogThrottleTest, IneligibleWithinWindowBypassesMutex) {
+  ulong threshold = 1;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 60000000, slow_logger, "%lu");
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+  mysql_mutex_lock(&m_mutex);
+  auto result = std::async(std::launch::async, [&] {
+    my_thread_init();
+    const bool suppressed = throttle.log(thd(), false);
+    my_thread_end();
+    return suppressed;
+  });
+  const auto ready = result.wait_for(std::chrono::seconds(5));
+  mysql_mutex_unlock(&m_mutex);
+  EXPECT_EQ(std::future_status::ready, ready);
+  EXPECT_FALSE(result.get());
+  EXPECT_EQ(0, summary_count);
+  EXPECT_TRUE(throttle.flush(thd()));
+  EXPECT_STREQ("1", last_query);
+}
+
+TEST_F(LogThrottleTest, IneligibleClosesExpiredWindow) {
+  ulong threshold = 1;
+  Slow_log_throttle throttle(&threshold, &m_mutex, 100000, slow_logger, "%lu");
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+  EXPECT_FALSE(throttle.log(thd(), false));
+  EXPECT_EQ(1, summary_count);
+  EXPECT_STREQ("1", last_query);
+  EXPECT_FALSE(throttle.log(thd(), false));
+  EXPECT_EQ(1, summary_count);
+  EXPECT_FALSE(throttle.log(thd(), true));
+  EXPECT_TRUE(throttle.log(thd(), true));
+}
 
 }  // namespace log_throttle_unittest
